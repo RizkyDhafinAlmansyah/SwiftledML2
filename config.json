@@ -1,0 +1,39 @@
+{
+  "feature_cols": [
+    "id",
+    "suhu",
+    "kelembaban",
+    "amonia",
+    "suhu_rollmean_1h",
+    "suhu_rollstd_1h",
+    "suhu_rollmean_6h",
+    "suhu_rollstd_6h",
+    "suhu_rollmean_24h",
+    "suhu_rollstd_24h",
+    "kelembaban_rollmean_1h",
+    "kelembaban_rollstd_1h",
+    "kelembaban_rollmean_6h",
+    "kelembaban_rollstd_6h",
+    "kelembaban_rollmean_24h",
+    "kelembaban_rollstd_24h",
+    "amonia_rollmean_1h",
+    "amonia_rollstd_1h",
+    "amonia_rollmean_6h",
+    "amonia_rollstd_6h",
+    "amonia_rollmean_24h",
+    "amonia_rollstd_24h"
+  ],
+  "class_to_idx": {
+    "bagus": 0,
+    "jelek": 1,
+    "sedang": 2
+  },
+  "idx_to_class": {
+    "0": "bagus",
+    "1": "jelek",
+    "2": "sedang"
+  },
+  "time_split": true,
+  "source_csv": "data\\lantai1_data.csv",
+  "note": "Safeguards single-class; LightGBM objective by n_classes_train; pseudo labels if missing."
+}
