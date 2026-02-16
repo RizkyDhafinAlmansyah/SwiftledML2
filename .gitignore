@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Data besar
+data/processed/
+data/raw/
+*.csv
+!ai-engine/sensor_cleaned.csv
+
+# Backup model lama
+ModelLama/
+
+# Misc
+*.log

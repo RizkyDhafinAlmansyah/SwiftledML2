@@ -1,12 +1,18 @@
 services:
-  db:
-    image: postgres:16
+  ai-engine:
+    build: ./ai-engine
+    container_name: swiftlet-ai-engine
+    restart: always
+    ports:
+      - "${PORT:-8000}:8000"
+    env_file:
+      - .env
     environment:
-      POSTGRES_DB: swiftlet
-      POSTGRES_USER: swift
-      POSTGRES_PASSWORD: swiftpass
-    ports: ["5432:5432"]
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-volumes:
-  pgdata: {}
+      ART_DIR: "/app"
+      USE_ISO_ANOM: "1"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
