@@ -30,13 +30,13 @@ import joblib
 # -----------------------------
 # 0. Path data & artefak
 # -----------------------------
-# Kaggle
-DATA_PATH = "/kaggle/input/sensor-syntesis/ml_training_dataset.csv"
+# Kaggle — dataset: real (83%) + synthetic bagus saja (17%)
+DATA_PATH = "/kaggle/input/dataset-merged-030426/ml_training_smart.csv"
 MODELS_DIR = "/kaggle/working"
 
 # Lokal (uncomment jika di lokal)
-# DATA_PATH = "data/ml_training_dataset.csv"
-# MODELS_DIR = "models"
+# DATA_PATH = "data/ml_training_smart.csv"
+# MODELS_DIR = "ai-engine"
 
 os.makedirs(MODELS_DIR, exist_ok=True)
 

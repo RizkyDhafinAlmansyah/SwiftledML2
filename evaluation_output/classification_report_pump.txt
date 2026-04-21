@@ -1,0 +1,10 @@
+CLASSIFICATION REPORT - PUMP STATE
+==================================================
+              precision    recall  f1-score   support
+
+         OFF       0.79      1.00      0.88      4028
+          ON       1.00      0.63      0.77      2810
+
+    accuracy                           0.85      6838
+   macro avg       0.90      0.81      0.83      6838
+weighted avg       0.88      0.85      0.84      6838

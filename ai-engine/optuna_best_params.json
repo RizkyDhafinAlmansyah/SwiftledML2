@@ -1,0 +1,89 @@
+{
+  "optuna_trials": 50,
+  "cv_folds": 3,
+  "features_grade": [
+    "temperature",
+    "humidity",
+    "ammonia",
+    "temp_avg_1h",
+    "humid_avg_1h",
+    "nh3_avg_1h",
+    "comfort_index",
+    "is_daytime",
+    "day_of_week",
+    "temp_humid_interaction",
+    "time_norm"
+  ],
+  "features_pump_state": [
+    "temperature",
+    "humidity",
+    "ammonia",
+    "temp_avg_1h",
+    "humid_avg_1h",
+    "humid_delta_1h",
+    "hour_of_day",
+    "day_of_week",
+    "temp_humid_interaction",
+    "nh3_rate_of_change",
+    "temp_rolling_std",
+    "time_norm"
+  ],
+  "features_pump_duration": [
+    "temperature",
+    "humidity",
+    "ammonia",
+    "temp_avg_1h",
+    "humid_avg_1h",
+    "humid_delta_1h",
+    "hour_of_day",
+    "comfort_index",
+    "temp_humid_interaction",
+    "nh3_rate_of_change",
+    "temp_rolling_std",
+    "time_norm"
+  ],
+  "best_params_grade": {
+    "n_estimators": 125,
+    "max_depth": 5,
+    "num_leaves": 12,
+    "learning_rate": 0.14046950240877729,
+    "min_child_samples": 101,
+    "subsample": 0.6257755247498842,
+    "colsample_bytree": 0.6987148659883341,
+    "reg_alpha": 1.529790984270032,
+    "reg_lambda": 3.7500901394036075,
+    "objective": "multiclass",
+    "num_class": 3
+  },
+  "best_params_pump_state": {
+    "n_estimators": 125,
+    "max_depth": 5,
+    "num_leaves": 16,
+    "learning_rate": 0.11159043564279482,
+    "min_child_samples": 129,
+    "subsample": 0.6542218521046114,
+    "colsample_bytree": 0.5935059712584009,
+    "reg_alpha": 0.6663416232375438,
+    "reg_lambda": 3.215927040751956,
+    "objective": "binary",
+    "scale_pos_weight": 0.12574580659687043
+  },
+  "best_params_pump_duration": {
+    "n_estimators": 150,
+    "max_depth": 3,
+    "num_leaves": 11,
+    "learning_rate": 0.2739510286403873,
+    "min_child_samples": 109,
+    "subsample": 0.7430894502390808,
+    "colsample_bytree": 0.5573398943531263,
+    "reg_alpha": 1.8547283273483683,
+    "reg_lambda": 2.365581302757195,
+    "objective": "regression"
+  },
+  "metrics": {
+    "grade_cv_f1_macro": 0.4998,
+    "pump_state_cv_f1": 0.9618,
+    "pump_duration_test_mae": 0.09,
+    "pump_duration_test_r2": 0.9927
+  }
+}

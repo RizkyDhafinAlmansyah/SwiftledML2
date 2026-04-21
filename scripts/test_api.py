@@ -141,6 +141,137 @@ def test_clear_buffer():
     return resp.status_code == 200
 
 
+def test_pump_ml():
+    """Test ML-based pump recommendation."""
+    print("\n[10] Testing /v1/recommend-pump-action (ML mode)...")
+
+    payload = {
+        "node_id": "test-pump-ml",
+        "rbw_id": "rbw-01",
+        "current_temp": 31.0,
+        "current_humid": 70.0,
+        "current_ammonia": 12.0,
+        "pump_currently_on": False,
+        "use_ml": True,
+    }
+
+    resp = requests.post(f"{BASE_URL}/v1/recommend-pump-action", json=payload)
+    data = resp.json()
+
+    print(f"    Status: {resp.status_code}")
+    print(f"    Action: {data.get('action', 'N/A')}")
+    print(f"    Reason: {data.get('reason', 'N/A')}")
+    print(f"    Engine: {data.get('engine', 'N/A')}")
+    print(f"    Confidence: {data.get('confidence', 'N/A')}")
+    print(f"    Duration (s): {data.get('recommended_duration_seconds', 'N/A')}")
+
+    # Engine should exist and be one of the expected values
+    assert data.get("engine") in ("ml+safety", "rule-fallback", "safety", "rule-only"), \
+        f"Unexpected engine: {data.get('engine')}"
+
+    return resp.status_code == 200
+
+
+def test_pump_safety_override():
+    """Test that safety rules override ML when NH3 is critical."""
+    print("\n[11] Testing pump safety override (NH3 critical)...")
+
+    payload = {
+        "node_id": "test-pump-safety",
+        "rbw_id": "rbw-01",
+        "current_temp": 25.0,
+        "current_humid": 85.0,
+        "current_ammonia": 30.0,   # Critical NH3 level
+        "pump_currently_on": False,
+        "use_ml": True,
+    }
+
+    resp = requests.post(f"{BASE_URL}/v1/recommend-pump-action", json=payload)
+    data = resp.json()
+
+    print(f"    Status: {resp.status_code}")
+    print(f"    Action: {data.get('action', 'N/A')}")
+    print(f"    Engine: {data.get('engine', 'N/A')}")
+    print(f"    Reason: {data.get('reason', 'N/A')}")
+
+    # Safety override: should always turn_on with engine=safety
+    assert data.get("action") == "turn_on", f"Expected turn_on but got {data.get('action')}"
+    assert data.get("engine") == "safety", f"Expected safety engine but got {data.get('engine')}"
+
+    return resp.status_code == 200
+
+
+def test_pump_rule_fallback():
+    """Test pump with use_ml=False (pure rule-based)."""
+    print("\n[12] Testing pump rule-based (use_ml=False)...")
+
+    payload = {
+        "node_id": "test-pump-rule",
+        "rbw_id": "rbw-01",
+        "current_temp": 31.0,
+        "current_humid": 70.0,
+        "current_ammonia": 8.0,
+        "pump_currently_on": False,
+        "use_ml": False,
+    }
+
+    resp = requests.post(f"{BASE_URL}/v1/recommend-pump-action", json=payload)
+    data = resp.json()
+
+    print(f"    Status: {resp.status_code}")
+    print(f"    Action: {data.get('action', 'N/A')}")
+    print(f"    Engine: {data.get('engine', 'N/A')}")
+
+    assert data.get("engine") == "rule-only", f"Expected rule-only engine but got {data.get('engine')}"
+
+    return resp.status_code == 200
+
+
+def test_feedback():
+    """Test feedback submission endpoint."""
+    print("\n[13] Testing /v1/feedback...")
+
+    payload = {
+        "node_id": "test-node",
+        "actual_grade": "bagus",
+        "pump_was_needed": True,
+        "pump_was_effective": True,
+        "duration_feedback": "just_right",
+        "notes": "Test feedback from test_api.py",
+    }
+
+    resp = requests.post(f"{BASE_URL}/v1/feedback", json=payload)
+    data = resp.json()
+
+    print(f"    Status: {resp.status_code}")
+    if resp.status_code == 200:
+        print(f"    OK: {data.get('ok', 'N/A')}")
+        print(f"    Feedback ID: {data.get('feedback_id', 'N/A')}")
+    elif resp.status_code == 503:
+        print(f"    Expected: DB not configured ({data.get('detail', '')})")
+    print(f"    Response: {data}")
+
+    # Either 200 (DB configured) or 503 (DB not configured) is acceptable
+    return resp.status_code in (200, 503)
+
+
+def test_feedback_stats():
+    """Test feedback stats endpoint."""
+    print("\n[14] Testing /v1/feedback-stats...")
+
+    resp = requests.get(f"{BASE_URL}/v1/feedback-stats")
+    data = resp.json()
+
+    print(f"    Status: {resp.status_code}")
+    if resp.status_code == 200:
+        print(f"    Total feedbacks: {data.get('total_feedbacks', 'N/A')}")
+    elif resp.status_code == 503:
+        print(f"    Expected: DB not configured ({data.get('detail', '')})")
+    print(f"    Response: {json.dumps(data, indent=2)[:200]}...")
+
+    return resp.status_code in (200, 503)
+
+
 def main():
     print("=" * 60)
     print("AI ENGINE API TEST")
@@ -166,6 +297,11 @@ def main():
         ("Decide v2", test_decide_v2),
         ("Legacy Decide", test_legacy_decide),
         ("Clear Buffer", test_clear_buffer),
+        ("Pump ML", test_pump_ml),
+        ("Pump Safety Override", test_pump_safety_override),
+        ("Pump Rule Fallback", test_pump_rule_fallback),
+        ("Feedback Submit", test_feedback),
+        ("Feedback Stats", test_feedback_stats),
     ]
     
     results = []

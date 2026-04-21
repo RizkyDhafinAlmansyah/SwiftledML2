@@ -129,14 +129,14 @@ except Exception as e:
 try:
     if os.path.exists(PATH_PUMP_STATE_V2):
         pump_state_model_v2 = _safe_load_pickle(PATH_PUMP_STATE_V2)
-        print("[BOOT] Loaded model_pump_state_v2.pkl OK (belum di-wire ke endpoint)")
+        print("[BOOT] Loaded model_pump_state_v2.pkl OK (wired to predict_pump_ml)")
 except Exception as e:
     print(f"[WARN] gagal load model_pump_state_v2.pkl: {e}")
 
 try:
     if os.path.exists(PATH_PUMP_DURATION_V2):
         pump_duration_model_v2 = _safe_load_pickle(PATH_PUMP_DURATION_V2)
-        print("[BOOT] Loaded model_pump_duration_v2.pkl OK (belum di-wire ke endpoint)")
+        print("[BOOT] Loaded model_pump_duration_v2.pkl OK (wired to predict_pump_ml)")
 except Exception as e:
     print(f"[WARN] gagal load model_pump_duration_v2.pkl: {e}")
 
@@ -199,18 +199,26 @@ FEATURES_GRADE = [
     "temperature", "humidity", "ammonia",
     "temp_avg_1h", "humid_avg_1h", "nh3_avg_1h",
     "comfort_index", "is_daytime",
+    # Optuna v2 features
+    "day_of_week", "temp_humid_interaction", "time_norm",
 ]
 
 FEATURES_PUMP_STATE = [
     "temperature", "humidity", "ammonia",
     "temp_avg_1h", "humid_avg_1h", "humid_delta_1h",
     "hour_of_day",
+    # Optuna v2 features
+    "day_of_week", "temp_humid_interaction", "nh3_rate_of_change",
+    "temp_rolling_std", "time_norm",
 ]
 
 FEATURES_PUMP_DURATION = [
     "temperature", "humidity", "ammonia",
     "temp_avg_1h", "humid_avg_1h", "humid_delta_1h",
     "hour_of_day", "comfort_index",
+    # Optuna v2 features
+    "temp_humid_interaction", "nh3_rate_of_change",
+    "temp_rolling_std", "time_norm",
 ]
 
 
@@ -272,6 +280,18 @@ def build_base_features(
     }
 
     feat["comfort_index"] = calculate_comfort_index(t, h, n)
+
+    # --- Optuna v2 features ---
+    feat["day_of_week"] = float(dt.weekday())  # 0=Mon, 6=Sun
+    feat["temp_humid_interaction"] = round(t * h / 100.0, 2)
+    feat["time_norm"] = round(hour / 24.0, 4)
+
+    # nh3_rate_of_change: from extra (buffer) or default 0
+    feat["nh3_rate_of_change"] = float(extra.get("nh3_rate_of_change", 0.0))
+
+    # temp_rolling_std: from extra (buffer) or default 0
+    feat["temp_rolling_std"] = float(extra.get("temp_rolling_std", 0.0))
+
     return feat
 
 # ============================================================
@@ -336,6 +356,150 @@ def decide_spray_with_state(
             state.last_change_ts = now
             return True, "on_by_condition"
         return False, "stay_off"
+
+
+# ============================================================
+# 5B) HYBRID ML PUMP DECISION
+# ============================================================
+
+def predict_pump_ml(
+    node_id: str,
+    temp_c: Optional[float],
+    rh: Optional[float],
+    nh3_ppm: Optional[float],
+    recorded_ts: Optional[float] = None,
+    extra: Optional[Dict[str, Any]] = None,
+    cfg_ctrl: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
+    """
+    Hybrid ML + safety-rules pump decision.
+
+    Priority:
+      1. Safety guards   – non-negotiable rules (NH3 critical, overheating, invalid sensor)
+      2. ML prediction   – model_pump_state_v2 + model_pump_duration_v2
+      3. Rule fallback   – decide_spray_with_state() when models unavailable
+    """
+    _ctrl = cfg_ctrl or ctrl
+
+    # ---------- 0. sensor validity ----------
+    if temp_c is None or rh is None:
+        return {
+            "action": "keep_current",
+            "reason": "sensor_invalid",
+            "confidence": 0.0,
+            "duration_seconds": 0.0,
+            "engine": "safety",
+        }
+
+    t = float(temp_c)
+    h = float(rh)
+    n = float(nh3_ppm) if nh3_ppm is not None else 5.0  # default NH3
+
+    # ---------- 1. safety guards ----------
+    if n >= 25.0:
+        return {
+            "action": "turn_on",
+            "reason": "NH3_CRITICAL (>=25 ppm) - safety override",
+            "confidence": 0.99,
+            "duration_seconds": 30.0,  # max spray
+            "engine": "safety",
+        }
+    if t >= 35.0:
+        return {
+            "action": "turn_on",
+            "reason": "TEMP_CRITICAL (>=35°C) - safety override",
+            "confidence": 0.99,
+            "duration_seconds": 25.0,
+            "engine": "safety",
+        }
+
+    # ---------- 2. ML prediction ----------
+    if pump_state_model_v2 is not None:
+        try:
+            base_feat = build_base_features(t, h, n, recorded_ts, extra)
+            X_state = pd.DataFrame(
+                [[base_feat[f] for f in FEATURES_PUMP_STATE]],
+                columns=FEATURES_PUMP_STATE,
+            )
+
+            state_pred = int(pump_state_model_v2.predict(X_state)[0])
+
+            # confidence from predict_proba
+            confidence = 0.7  # default
+            if hasattr(pump_state_model_v2, "predict_proba"):
+                proba = pump_state_model_v2.predict_proba(X_state)[0]
+                confidence = float(max(proba))
+
+            # duration from ML model
+            duration_sec = 0.0
+            if state_pred == 1 and pump_duration_model_v2 is not None:
+                X_dur = pd.DataFrame(
+                    [[base_feat[f] for f in FEATURES_PUMP_DURATION]],
+                    columns=FEATURES_PUMP_DURATION,
+                )
+                raw_dur = float(pump_duration_model_v2.predict(X_dur)[0])
+                duration_sec = max(5.0, min(30.0, raw_dur))  # clamp 5-30s
+
+            # apply hysteresis via existing state
+            st = get_state(node_id)
+            now = time.time() if recorded_ts is None else float(recorded_ts)
+            elapsed = now - st.last_change_ts
+
+            if state_pred == 1:  # ML says ON
+                if not st.is_on:
+                    # check cooldown
+                    if (now - st.last_off_ts) < st.cooldown:
+                        return {
+                            "action": "keep_current",
+                            "reason": f"ml_wants_on but cooldown ({st.cooldown - (now - st.last_off_ts):.0f}s remaining)",
+                            "confidence": confidence,
+                            "duration_seconds": 0.0,
+                            "engine": "ml+safety",
+                        }
+                    st.is_on = True
+                    st.last_change_ts = now
+                action = "turn_on"
+                reason = "ml_pump_state_on"
+            else:  # ML says OFF
+                if st.is_on and elapsed < st.min_on:
+                    return {
+                        "action": "keep_current",
+                        "reason": f"ml_wants_off but hold_min_on ({st.min_on - elapsed:.0f}s remaining)",
+                        "confidence": confidence,
+                        "duration_seconds": 0.0,
+                        "engine": "ml+safety",
+                    }
+                if st.is_on:
+                    st.is_on = False
+                    st.last_change_ts = now
+                    st.last_off_ts = now
+                action = "turn_off"
+                reason = "ml_pump_state_off"
+                duration_sec = 0.0
+
+            return {
+                "action": action,
+                "reason": reason,
+                "confidence": round(confidence, 4),
+                "duration_seconds": round(duration_sec, 1),
+                "engine": "ml+safety",
+            }
+
+        except Exception as e:
+            print(f"[WARN] predict_pump_ml error: {e}, falling back to rule-based")
+
+    # ---------- 3. rule-based fallback ----------
+    st = get_state(node_id)
+    on, reason = decide_spray_with_state(st, t, h, n, _ctrl, now_ts=recorded_ts)
+
+    return {
+        "action": "turn_on" if on else "turn_off",
+        "reason": reason,
+        "confidence": 0.6,
+        "duration_seconds": float(st.min_on) if on else 0.0,
+        "engine": "rule-fallback",
+    }
+
 
 # ============================================================
 # 6) PREDICT GRADE & ANOMALY HELPERS
@@ -498,6 +662,86 @@ def save_decision(row: dict):
     finally:
         db.close()
 
+
+class Feedback(Base):
+    """Operator feedback for model evaluation and retraining."""
+    __tablename__ = "feedbacks"
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    node_id = Column(String, index=True, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # Reference to the decision being evaluated
+    decision_id = Column(String(36), nullable=True, index=True)
+
+    # Sensor context at time of feedback
+    temp_c = Column(Float, nullable=True)
+    rh = Column(Float, nullable=True)
+    nh3_ppm = Column(Float, nullable=True)
+
+    # Grade feedback
+    predicted_grade = Column(String, nullable=True)   # what model predicted
+    actual_grade = Column(String, nullable=True)       # operator's correction: "bagus"/"sedang"/"buruk"
+
+    # Pump feedback
+    predicted_pump_on = Column(Boolean, nullable=True)  # what model predicted
+    pump_was_needed = Column(Boolean, nullable=True)     # was spray actually needed?
+    pump_was_effective = Column(Boolean, nullable=True)   # did spray help?
+    duration_feedback = Column(String, nullable=True)     # "too_short"/"just_right"/"too_long"
+
+    # Free-text notes
+    notes = Column(String, nullable=True)
+
+
+# --- Harvest Tracking (tentatif) ---
+class Harvest(Base):
+    """Track setiap siklus panen (2-3 bulan) untuk recap & analisis."""
+    __tablename__ = "harvests"
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    node_id = Column(String, index=True, nullable=False)
+    harvest_number = Column(Float, nullable=True)  # panen ke-1, ke-2, dst
+
+    # Periode siklus
+    cycle_start = Column(DateTime(timezone=True), nullable=False)
+    cycle_end = Column(DateTime(timezone=True), nullable=True)
+
+    # Hasil panen aktual (diisi operator)
+    actual_grade = Column(String, nullable=True)      # bagus/sedang/buruk
+    nests_count = Column(Float, nullable=True)         # jumlah sarang
+    weight_kg = Column(Float, nullable=True)           # berat total
+    notes = Column(String, nullable=True)
+
+    # Stats otomatis (dihitung dari decisions selama siklus)
+    avg_temp = Column(Float, nullable=True)
+    avg_humid = Column(Float, nullable=True)
+    avg_nh3 = Column(Float, nullable=True)
+    total_pump_on = Column(Float, nullable=True)
+    total_anomalies = Column(Float, nullable=True)
+    dominant_predicted_grade = Column(String, nullable=True)
+    avg_comfort_index = Column(Float, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+if engine:
+    Base.metadata.create_all(engine)
+
+
+def save_feedback(row: dict) -> bool:
+    """Save feedback to DB. Returns True if saved, False if DB not configured."""
+    if not engine:
+        return False
+    db = SessionLocal()
+    try:
+        db.add(Feedback(**row))
+        db.commit()
+        return True
+    except Exception as e:
+        db.rollback()
+        print(f"[WARN] save_feedback error: {e}")
+        return False
+    finally:
+        db.close()
+
 # ============================================================
 # 8) FASTAPI APP & SCHEMAS
 # ============================================================
@@ -607,8 +851,15 @@ def decide(req: DecideRequest):
 
     grade, probs = predict_grade_from_values(t, r, n, recorded_ts=req.timestamp, extra=req.extra_features)
 
-    st = get_state(req.node_id)
-    on, reason = decide_spray_with_state(st, t, r, n, ctrl, now_ts=req.timestamp)
+    # ML-based pump decision (hybrid: ML + safety + hysteresis)
+    pump_result = predict_pump_ml(
+        node_id=req.node_id,
+        temp_c=t, rh=r, nh3_ppm=n,
+        recorded_ts=req.timestamp,
+        extra=req.extra_features,
+    )
+    on = pump_result["action"] == "turn_on"
+    reason = pump_result["reason"]
 
     anom = _detect_anomaly({TEMP_COL: t, RH_COL: r, NH3_COL: n})
 
@@ -633,6 +884,7 @@ def decide(req: DecideRequest):
         "used_rh_off": ctrl.get("rh_off"),
     })
 
+    st = get_state(req.node_id)
     now_ts = time.time()
     debug = {
         "node_id": req.node_id,
@@ -641,8 +893,9 @@ def decide(req: DecideRequest):
         "min_on_s": st.min_on,
         "min_off_s": st.min_off,
         "cooldown_remaining_s": round(max(0.0, st.cooldown - (now_ts - st.last_off_ts)), 2),
-        "last_change_ts": st.last_change_ts,
-        "last_off_ts": st.last_off_ts,
+        "pump_engine": pump_result["engine"],
+        "pump_confidence": pump_result["confidence"],
+        "pump_duration_s": pump_result["duration_seconds"],
     }
 
     return DecideResponse(
@@ -657,7 +910,7 @@ def decide(req: DecideRequest):
             "rh_on":   ctrl.get("rh_on"),
             "rh_off":  ctrl.get("rh_off"),
         },
-        note="Hysteresis rule-based aktif; prediksi grade & anomaly pakai model v2.",
+        note=f"Pump engine: {pump_result['engine']}; grade & anomaly pakai model v2.",
         debug=debug,
         request_id=req.request_id,
     )
@@ -713,6 +966,7 @@ class PumpRecommendRequest(BaseModel):
     temp_trend_1hour: Optional[str] = None  # "rising"|"falling"|"stable"
     humid_trend_1hour: Optional[str] = None
     pump_currently_on: bool
+    use_ml: bool = True  # Use ML model if available, else rule-based
 
 
 class PumpRecommendResponse(BaseModel):
@@ -720,8 +974,10 @@ class PumpRecommendResponse(BaseModel):
     reason: str
     confidence: float
     recommended_duration_minutes: Optional[int] = None
+    recommended_duration_seconds: Optional[float] = None
     expected_outcome: Optional[Dict[str, Any]] = None
     recommended_at: Optional[str] = None
+    engine: Optional[str] = None  # "ml+safety" | "rule-fallback" | "safety"
 
 # --- /v1/anomaly-detect ---
 @app.post("/v1/anomaly-detect", response_model=AnomalyResponse)
@@ -812,45 +1068,64 @@ def v1_predict_grade(req: PredictGradeRequest):
 # --- /v1/recommend-pump-action ---
 @app.post("/v1/recommend-pump-action", response_model=PumpRecommendResponse)
 def v1_recommend_pump(req: PumpRecommendRequest):
+    # Sync hysteresis state with request
     st = get_state(req.node_id)
     st.is_on = bool(req.pump_currently_on)
 
-    on, reason = decide_spray_with_state(
-        st,
-        temp_c=float(req.current_temp),
-        rh=float(req.current_humid),
-        nh3_ppm=float(req.current_ammonia) if req.current_ammonia is not None else None,
-        cfg_ctrl=ctrl,
-        now_ts=None,
-    )
-
-    if on and not req.pump_currently_on:
-        action = "turn_on"
-    elif (not on) and req.pump_currently_on:
-        action = "turn_off"
+    if req.use_ml:
+        # ML-based pump decision (hybrid: ML + safety + hysteresis)
+        pump_result = predict_pump_ml(
+            node_id=req.node_id,
+            temp_c=float(req.current_temp),
+            rh=float(req.current_humid),
+            nh3_ppm=float(req.current_ammonia) if req.current_ammonia is not None else None,
+        )
+        action = pump_result["action"]
+        reason = pump_result["reason"]
+        conf = pump_result["confidence"]
+        duration_sec = pump_result["duration_seconds"]
+        engine_used = pump_result["engine"]
     else:
-        action = "keep_current"
+        # Pure rule-based fallback
+        on, reason = decide_spray_with_state(
+            st,
+            temp_c=float(req.current_temp),
+            rh=float(req.current_humid),
+            nh3_ppm=float(req.current_ammonia) if req.current_ammonia is not None else None,
+            cfg_ctrl=ctrl,
+            now_ts=None,
+        )
+        if on and not req.pump_currently_on:
+            action = "turn_on"
+        elif (not on) and req.pump_currently_on:
+            action = "turn_off"
+        else:
+            action = "keep_current"
+        target_rh = ctrl.get("rh_off", 75.0)
+        delta = abs(target_rh - req.current_humid)
+        conf = max(0.5, min(0.99, delta / 20.0 + 0.5))
+        duration_sec = float(st.min_on) if action == "turn_on" else 0.0
+        engine_used = "rule-only"
 
-    duration_min = int(max(1, round(st.min_on / 60.0))) if action == "turn_on" else None
+    duration_min = int(max(1, round(duration_sec / 60.0))) if action == "turn_on" and duration_sec > 0 else None
 
     target_rh = ctrl.get("rh_off", 75.0)
-    delta = abs(target_rh - req.current_humid)
-    conf = max(0.5, min(0.99, delta / 20.0 + 0.5))
-
     expected = {
         "target_humid": float(target_rh),
-        "estimated_time_minutes": duration_min if duration_min else 0,
+        "estimated_time_seconds": round(duration_sec, 1) if duration_sec > 0 else 0,
     } if action == "turn_on" else None
 
     ts = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
 
     return PumpRecommendResponse(
         action=action,
-        reason=reason if reason else "rule-based hysteresis decision",
+        reason=reason if reason else "pump decision",
         confidence=float(round(conf, 3)),
         recommended_duration_minutes=duration_min,
+        recommended_duration_seconds=round(duration_sec, 1) if action == "turn_on" else None,
         expected_outcome=expected,
         recommended_at=ts,
+        engine=engine_used,
     )
 
 # ============================================================
@@ -1047,9 +1322,15 @@ def v2_decide(req: DecideV2Request):
     # Predict grade using enhanced features
     grade, probs = predict_grade_from_values(t, r, n, recorded_ts=req.timestamp, extra=extra_features)
     
-    # Spray decision
-    st = get_state(req.node_id)
-    on, reason = decide_spray_with_state(st, t, r, n, ctrl, now_ts=req.timestamp)
+    # ML-based pump decision (hybrid: ML + safety + hysteresis)
+    pump_result = predict_pump_ml(
+        node_id=req.node_id,
+        temp_c=t, rh=r, nh3_ppm=n,
+        recorded_ts=req.timestamp,
+        extra=extra_features,
+    )
+    on = pump_result["action"] == "turn_on"
+    reason = pump_result["reason"]
     
     # Anomaly detection
     anom = _detect_anomaly({TEMP_COL: t, RH_COL: r, NH3_COL: n})
@@ -1100,13 +1381,464 @@ def v2_decide(req: DecideV2Request):
         },
         buffer_stats=buffer_stats_dict,
         features_used=features_used,
-        note="Enhanced v2 with sliding window buffer features." if req.use_buffer else "Buffer disabled, using single-point features.",
+        note=f"Pump engine: {pump_result['engine']}; v2 with buffer features." if req.use_buffer else f"Pump engine: {pump_result['engine']}; buffer disabled.",
         request_id=req.request_id,
     )
 
 
 # ============================================================
-# 12) ENTRYPOINT (untuk python app.py langsung)
+# 12) FEEDBACK LOOP ENDPOINTS
+# ============================================================
+
+class FeedbackRequest(BaseModel):
+    """Operator feedback for model evaluation."""
+    node_id: str
+    decision_id: Optional[str] = None   # ID of the decision being evaluated
+
+    # Sensor context (optional, for standalone feedback)
+    temperature_c: Optional[float] = None
+    humidity_rh: Optional[float] = None
+    nh3_ppm: Optional[float] = None
+
+    # Grade feedback
+    actual_grade: Optional[str] = None   # "bagus" / "sedang" / "buruk"
+
+    # Pump feedback
+    pump_was_needed: Optional[bool] = None      # was spray actually needed?
+    pump_was_effective: Optional[bool] = None    # did the spray help?
+    duration_feedback: Optional[str] = None      # "too_short" / "just_right" / "too_long"
+
+    # Additional notes
+    notes: Optional[str] = None
+
+
+class FeedbackResponse(BaseModel):
+    ok: bool
+    feedback_id: Optional[str] = None
+    message: str
+
+
+@app.post("/v1/feedback", response_model=FeedbackResponse)
+def v1_submit_feedback(req: FeedbackRequest):
+    """
+    Submit operator feedback for a decision.
+    This enables real-label collection for model retraining.
+    """
+    if not engine:
+        raise HTTPException(
+            status_code=503,
+            detail="Database not configured. Set DATABASE_URL env to enable feedback storage."
+        )
+
+    # Validate grade
+    valid_grades = {"bagus", "sedang", "buruk"}
+    if req.actual_grade and req.actual_grade.lower() not in valid_grades:
+        raise HTTPException(
+            status_code=400,
+            detail=f"actual_grade must be one of: {valid_grades}"
+        )
+
+    # Validate duration_feedback
+    valid_durations = {"too_short", "just_right", "too_long"}
+    if req.duration_feedback and req.duration_feedback.lower() not in valid_durations:
+        raise HTTPException(
+            status_code=400,
+            detail=f"duration_feedback must be one of: {valid_durations}"
+        )
+
+    fb_id = str(uuid4())
+
+    # If we have a decision_id, try to enrich from the decision record
+    predicted_grade = None
+    predicted_pump_on = None
+    if req.decision_id and engine:
+        db = SessionLocal()
+        try:
+            dec = db.query(Decision).filter(Decision.id == req.decision_id).first()
+            if dec:
+                predicted_grade = dec.grade_pred
+                predicted_pump_on = dec.sprayer_on
+                # Backfill sensor context from decision if not provided
+                if req.temperature_c is None:
+                    req.temperature_c = dec.temp_c
+                if req.humidity_rh is None:
+                    req.humidity_rh = dec.rh
+                if req.nh3_ppm is None:
+                    req.nh3_ppm = dec.nh3_ppm
+        finally:
+            db.close()
+
+    row = {
+        "id": fb_id,
+        "node_id": req.node_id,
+        "decision_id": req.decision_id,
+        "temp_c": req.temperature_c,
+        "rh": req.humidity_rh,
+        "nh3_ppm": req.nh3_ppm,
+        "predicted_grade": predicted_grade,
+        "actual_grade": req.actual_grade.lower() if req.actual_grade else None,
+        "predicted_pump_on": predicted_pump_on,
+        "pump_was_needed": req.pump_was_needed,
+        "pump_was_effective": req.pump_was_effective,
+        "duration_feedback": req.duration_feedback.lower() if req.duration_feedback else None,
+        "notes": req.notes,
+    }
+
+    saved = save_feedback(row)
+    if not saved:
+        raise HTTPException(status_code=500, detail="Failed to save feedback")
+
+    return FeedbackResponse(
+        ok=True,
+        feedback_id=fb_id,
+        message="Feedback saved successfully"
+    )
+
+
+@app.get("/v1/feedback-stats")
+def v1_feedback_stats(node_id: Optional[str] = Query(default=None)):
+    """
+    Get aggregated feedback statistics for model evaluation.
+    Optionally filter by node_id.
+    """
+    if not engine:
+        raise HTTPException(
+            status_code=503,
+            detail="Database not configured. Set DATABASE_URL env to enable feedback."
+        )
+
+    db = SessionLocal()
+    try:
+        q = db.query(Feedback)
+        if node_id:
+            q = q.filter(Feedback.node_id == node_id)
+
+        feedbacks = q.all()
+        total = len(feedbacks)
+
+        if total == 0:
+            return {
+                "total_feedbacks": 0,
+                "node_id_filter": node_id,
+                "grade_accuracy": None,
+                "pump_accuracy": None,
+                "pump_effectiveness_rate": None,
+                "duration_distribution": {},
+                "message": "No feedback data yet"
+            }
+
+        # Grade accuracy
+        grade_feedbacks = [f for f in feedbacks if f.predicted_grade and f.actual_grade]
+        grade_correct = sum(1 for f in grade_feedbacks if f.predicted_grade == f.actual_grade)
+        grade_accuracy = round(grade_correct / len(grade_feedbacks), 4) if grade_feedbacks else None
+
+        # Pump accuracy (was the pump decision correct?)
+        pump_feedbacks = [f for f in feedbacks if f.predicted_pump_on is not None and f.pump_was_needed is not None]
+        pump_correct = sum(1 for f in pump_feedbacks if f.predicted_pump_on == f.pump_was_needed)
+        pump_accuracy = round(pump_correct / len(pump_feedbacks), 4) if pump_feedbacks else None
+
+        # Pump effectiveness
+        eff_feedbacks = [f for f in feedbacks if f.pump_was_effective is not None]
+        eff_rate = round(sum(1 for f in eff_feedbacks if f.pump_was_effective) / len(eff_feedbacks), 4) if eff_feedbacks else None
+
+        # Duration distribution
+        dur_feedbacks = [f for f in feedbacks if f.duration_feedback]
+        dur_dist = {}
+        for dv in ["too_short", "just_right", "too_long"]:
+            dur_dist[dv] = sum(1 for f in dur_feedbacks if f.duration_feedback == dv)
+
+        return {
+            "total_feedbacks": total,
+            "node_id_filter": node_id,
+            "grade_accuracy": {
+                "correct": grade_correct if grade_feedbacks else 0,
+                "total": len(grade_feedbacks),
+                "accuracy": grade_accuracy,
+            },
+            "pump_accuracy": {
+                "correct": pump_correct if pump_feedbacks else 0,
+                "total": len(pump_feedbacks),
+                "accuracy": pump_accuracy,
+            },
+            "pump_effectiveness_rate": eff_rate,
+            "duration_distribution": dur_dist,
+        }
+    finally:
+        db.close()
+
+
+@app.get("/v1/export-training-data")
+def v1_export_training_data(
+    node_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=1000, ge=1, le=10000),
+):
+    """
+    Export decision + feedback data for model retraining.
+    Returns joined records with both predictions and operator feedback.
+    """
+    if not engine:
+        raise HTTPException(
+            status_code=503,
+            detail="Database not configured. Set DATABASE_URL env to enable data export."
+        )
+
+    db = SessionLocal()
+    try:
+        # Get decisions with their feedback (LEFT JOIN)
+        from sqlalchemy import outerjoin
+
+        q = db.query(Decision, Feedback).outerjoin(
+            Feedback, Decision.id == Feedback.decision_id
+        )
+        if node_id:
+            q = q.filter(Decision.node_id == node_id)
+
+        q = q.order_by(Decision.recorded_at.desc()).limit(limit)
+        results = q.all()
+
+        records = []
+        for dec, fb in results:
+            record = {
+                "decision_id": dec.id,
+                "node_id": dec.node_id,
+                "recorded_at": dec.recorded_at.isoformat() if dec.recorded_at else None,
+                # Sensor data
+                "temperature_c": dec.temp_c,
+                "humidity_rh": dec.rh,
+                "nh3_ppm": dec.nh3_ppm,
+                # Predictions
+                "predicted_grade": dec.grade_pred,
+                "p_bagus": dec.p_bagus,
+                "p_sedang": dec.p_sedang,
+                "p_buruk": dec.p_buruk,
+                "predicted_sprayer_on": dec.sprayer_on,
+                "sprayer_reason": dec.sprayer_reason,
+                "anomaly_verdict": dec.anom_verdict,
+                # Feedback (if any)
+                "has_feedback": fb is not None,
+                "actual_grade": fb.actual_grade if fb else None,
+                "pump_was_needed": fb.pump_was_needed if fb else None,
+                "pump_was_effective": fb.pump_was_effective if fb else None,
+                "duration_feedback": fb.duration_feedback if fb else None,
+                "feedback_notes": fb.notes if fb else None,
+            }
+            records.append(record)
+
+        return {
+            "count": len(records),
+            "node_id_filter": node_id,
+            "records": records,
+        }
+    finally:
+        db.close()
+
+
+# ============================================================
+# 13) HARVEST TRACKING ENDPOINTS (tentatif)
+# ============================================================
+
+class HarvestCreate(BaseModel):
+    node_id: str
+    harvest_number: Optional[int] = None
+    cycle_start: str              # ISO 8601
+    cycle_end: Optional[str] = None
+    actual_grade: Optional[str] = None
+    nests_count: Optional[int] = None
+    weight_kg: Optional[float] = None
+    notes: Optional[str] = None
+
+
+@app.post("/v1/harvest", tags=["Harvest"])
+def create_harvest(req: HarvestCreate):
+    """Catat siklus panen baru. Stats sensor otomatis dihitung dari data decisions."""
+    if not engine:
+        raise HTTPException(503, "Database not configured.")
+
+    from datetime import datetime as _dt
+    cycle_start_dt = _dt.fromisoformat(req.cycle_start.replace("Z", "+00:00"))
+    cycle_end_dt = None
+    if req.cycle_end:
+        cycle_end_dt = _dt.fromisoformat(req.cycle_end.replace("Z", "+00:00"))
+
+    # Auto-compute stats dari decisions selama siklus
+    stats = {}
+    db = SessionLocal()
+    try:
+        q = db.query(Decision).filter(
+            Decision.node_id == req.node_id,
+            Decision.recorded_at >= cycle_start_dt,
+        )
+        if cycle_end_dt:
+            q = q.filter(Decision.recorded_at <= cycle_end_dt)
+
+        decisions = q.all()
+
+        if decisions:
+            temps = [d.temp_c for d in decisions if d.temp_c is not None]
+            humids = [d.rh for d in decisions if d.rh is not None]
+            nh3s = [d.nh3_ppm for d in decisions if d.nh3_ppm is not None]
+            pump_ons = sum(1 for d in decisions if d.sprayer_on)
+            anomalies = sum(1 for d in decisions if d.anom_verdict == "anomaly")
+            grades = [d.grade_pred for d in decisions if d.grade_pred]
+
+            stats["avg_temp"] = round(sum(temps) / len(temps), 2) if temps else None
+            stats["avg_humid"] = round(sum(humids) / len(humids), 2) if humids else None
+            stats["avg_nh3"] = round(sum(nh3s) / len(nh3s), 2) if nh3s else None
+            stats["total_pump_on"] = pump_ons
+            stats["total_anomalies"] = anomalies
+
+            if grades:
+                from collections import Counter
+                stats["dominant_predicted_grade"] = Counter(grades).most_common(1)[0][0]
+
+            # Hitung avg comfort index
+            if temps and humids and nh3s:
+                ci_vals = [calculate_comfort_index(t, h, n)
+                           for t, h, n in zip(temps, humids, nh3s)]
+                stats["avg_comfort_index"] = round(sum(ci_vals) / len(ci_vals), 2)
+
+        harvest_id = str(uuid4())
+        harvest = Harvest(
+            id=harvest_id,
+            node_id=req.node_id,
+            harvest_number=req.harvest_number,
+            cycle_start=cycle_start_dt,
+            cycle_end=cycle_end_dt,
+            actual_grade=req.actual_grade,
+            nests_count=req.nests_count,
+            weight_kg=req.weight_kg,
+            notes=req.notes,
+            **stats,
+        )
+        db.add(harvest)
+        db.commit()
+
+        return {
+            "ok": True,
+            "harvest_id": harvest_id,
+            "decisions_in_cycle": len(decisions),
+            "computed_stats": stats,
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Error creating harvest: {e}")
+    finally:
+        db.close()
+
+
+@app.get("/v1/harvests", tags=["Harvest"])
+def list_harvests(node_id: Optional[str] = None):
+    """List semua panen, sorted by harvest_number."""
+    if not engine:
+        raise HTTPException(503, "Database not configured.")
+
+    db = SessionLocal()
+    try:
+        q = db.query(Harvest)
+        if node_id:
+            q = q.filter(Harvest.node_id == node_id)
+        q = q.order_by(Harvest.harvest_number.asc())
+        harvests = q.all()
+
+        results = []
+        for h in harvests:
+            results.append({
+                "harvest_id": h.id,
+                "node_id": h.node_id,
+                "harvest_number": h.harvest_number,
+                "cycle_start": h.cycle_start.isoformat() if h.cycle_start else None,
+                "cycle_end": h.cycle_end.isoformat() if h.cycle_end else None,
+                "actual_grade": h.actual_grade,
+                "nests_count": h.nests_count,
+                "weight_kg": h.weight_kg,
+                "notes": h.notes,
+                "stats": {
+                    "avg_temp": h.avg_temp,
+                    "avg_humid": h.avg_humid,
+                    "avg_nh3": h.avg_nh3,
+                    "total_pump_on": h.total_pump_on,
+                    "total_anomalies": h.total_anomalies,
+                    "dominant_predicted_grade": h.dominant_predicted_grade,
+                    "avg_comfort_index": h.avg_comfort_index,
+                },
+            })
+
+        return {"count": len(results), "harvests": results}
+    finally:
+        db.close()
+
+
+@app.get("/v1/harvest-compare", tags=["Harvest"])
+def compare_harvests(node_id: Optional[str] = None):
+    """Compare semua panen side-by-side: faktor apa yang berubah."""
+    if not engine:
+        raise HTTPException(503, "Database not configured.")
+
+    db = SessionLocal()
+    try:
+        q = db.query(Harvest)
+        if node_id:
+            q = q.filter(Harvest.node_id == node_id)
+        harvests = q.order_by(Harvest.harvest_number.asc()).all()
+
+        if len(harvests) < 2:
+            return {"message": "Minimal 2 panen untuk compare.", "harvests": len(harvests)}
+
+        comparisons = []
+        for i in range(1, len(harvests)):
+            prev, curr = harvests[i - 1], harvests[i]
+            factors = []
+
+            # Compare suhu
+            if prev.avg_temp and curr.avg_temp:
+                diff = curr.avg_temp - prev.avg_temp
+                if abs(diff) > 1:
+                    direction = "naik" if diff > 0 else "turun"
+                    impact = "negatif" if curr.avg_temp > 32 or curr.avg_temp < 24 else "netral"
+                    factors.append(f"Suhu rata-rata {direction} {abs(diff):.1f}°C (impact: {impact})")
+
+            # Compare kelembaban
+            if prev.avg_humid and curr.avg_humid:
+                diff = curr.avg_humid - prev.avg_humid
+                if abs(diff) > 3:
+                    direction = "naik" if diff > 0 else "turun"
+                    impact = "negatif" if curr.avg_humid < 65 or curr.avg_humid > 90 else "positif"
+                    factors.append(f"Kelembaban rata-rata {direction} {abs(diff):.1f}% (impact: {impact})")
+
+            # Compare NH3
+            if prev.avg_nh3 and curr.avg_nh3:
+                diff = curr.avg_nh3 - prev.avg_nh3
+                if abs(diff) > 2:
+                    direction = "naik" if diff > 0 else "turun"
+                    impact = "negatif" if diff > 0 else "positif"
+                    factors.append(f"Amonia rata-rata {direction} {abs(diff):.1f} ppm (impact: {impact})")
+
+            # Compare pump frequency
+            if prev.total_pump_on is not None and curr.total_pump_on is not None:
+                diff = (curr.total_pump_on or 0) - (prev.total_pump_on or 0)
+                if abs(diff) > 10:
+                    factors.append(f"Frekuensi pump {'naik' if diff > 0 else 'turun'} {abs(int(diff))}x")
+
+            # Compare anomalies
+            if prev.total_anomalies is not None and curr.total_anomalies is not None:
+                diff = (curr.total_anomalies or 0) - (prev.total_anomalies or 0)
+                if abs(diff) > 3:
+                    factors.append(f"Anomali {'naik' if diff > 0 else 'turun'} {abs(int(diff))}x")
+
+            comparisons.append({
+                "from": f"Panen #{int(prev.harvest_number)}" if prev.harvest_number else prev.id[:8],
+                "to": f"Panen #{int(curr.harvest_number)}" if curr.harvest_number else curr.id[:8],
+                "grade_change": f"{prev.actual_grade or '?'} → {curr.actual_grade or '?'}",
+                "key_factors": factors if factors else ["Tidak ada perubahan signifikan"],
+            })
+
+        return {"comparisons": comparisons}
+    finally:
+        db.close()
+
+
+# ============================================================
+# 14) ENTRYPOINT (untuk python app.py langsung)
 # ============================================================
 
 if __name__ == "__main__":

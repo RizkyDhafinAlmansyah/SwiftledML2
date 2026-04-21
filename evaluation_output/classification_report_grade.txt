@@ -1,0 +1,13 @@
+CLASSIFICATION REPORT - GRADE PREDICTION
+==================================================
+              precision    recall  f1-score   support
+
+       bagus       0.72      0.71      0.71       838
+       buruk       0.95      0.87      0.91      3846
+      sedang       0.74      0.86      0.80      2154
+
+    accuracy                           0.85      6838
+   macro avg       0.80      0.81      0.81      6838
+weighted avg       0.86      0.85      0.85      6838
+
+Accuracy: 0.8472

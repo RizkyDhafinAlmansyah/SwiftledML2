@@ -29,13 +29,13 @@ import joblib
 # -----------------------------
 # 0. Path data & artefak
 # -----------------------------
-# Kaggle
-DATA_PATH = "/kaggle/input/sensor-syntesis/ml_training_dataset.csv"
+# Kaggle — dataset: real + external (GAMS indoor)
+DATA_PATH = "/kaggle/input/swiftledml-merged-external/ml_training_with_external.csv"
 MODELS_DIR = "/kaggle/working"
 
 # Lokal (uncomment jika di lokal)
-# DATA_PATH = "data/ml_training_dataset.csv"
-# MODELS_DIR = "models"
+# DATA_PATH = "data/ml_training_with_external.csv"
+# MODELS_DIR = "ai-engine"
 
 os.makedirs(MODELS_DIR, exist_ok=True)
 
@@ -123,11 +123,17 @@ df["comfort_index"] = df[["temperature", "humidity", "ammonia"]].apply(
     axis=1
 )
 
+# 2.5 Optuna v2 features
+df["day_of_week"] = df["dt"].dt.dayofweek.fillna(0).astype(int)
+df["temp_humid_interaction"] = (df["temperature"] * df["humidity"]) / 100.0
+df["time_norm"] = df["hour_of_day"] / 24.0
+
 # Drop NaN
 derived_cols = [
     "temperature", "humidity", "ammonia",
     "temp_avg_1h", "humid_avg_1h", "nh3_avg_1h",
-    "comfort_index", "is_daytime"
+    "comfort_index", "is_daytime",
+    "day_of_week", "temp_humid_interaction", "time_norm",
 ]
 df = df.dropna(subset=derived_cols).reset_index(drop=True)
 print(f"  Shape after features: {df.shape}")
@@ -138,20 +144,47 @@ print(f"  Shape after features: {df.shape}")
 print("\n[3] Labeling grade...")
 
 def label_grade(row):
-    ci   = row["comfort_index"]
+    """
+    Revised labeling berdasarkan domain knowledge:
+    - Suhu < 30°C + RH 75-85% + NH3 < 10 → bagus
+    - Suhu > 33°C → buruk
+    - Suhu > 32°C + RH < 72% → buruk
+    - Extreme values → buruk
+    - Sisanya → sedang
+    """
     temp = row["temperature"]
     rh   = row["humidity"]
     nh3  = row["ammonia"]
 
-    if (nh3 > 35) or (temp < 20 or temp > 35) or (rh < 60 or rh > 95):
+    # Extreme conditions → buruk
+    if nh3 > 25 or temp > 35 or temp < 20 or rh < 55 or rh > 95:
         return "buruk"
 
-    if ci > 70:
+    # BAGUS: suhu sejuk + humidity ideal + NH3 rendah
+    if temp < 30 and 75 <= rh <= 85 and nh3 < 10:
         return "bagus"
-    elif ci >= 50:
-        return "sedang"
-    else:
+
+    # BURUK: suhu panas + humidity rendah
+    if temp > 32 and rh < 72:
         return "buruk"
+
+    # BURUK: suhu sangat panas
+    if temp > 33:
+        return "buruk"
+
+    # SEDANG: suhu OK tapi humidity kurang ideal
+    if temp < 30 and (rh < 75 or rh > 85):
+        return "sedang"
+
+    # SEDANG: suhu agak panas tapi humidity masih OK
+    if 30 <= temp <= 32 and rh >= 75:
+        return "sedang"
+
+    # SEDANG/BURUK: suhu agak panas + humidity kurang
+    if 30 <= temp <= 32 and rh < 75:
+        return "buruk" if nh3 > 10 else "sedang"
+
+    return "sedang"
 
 df["grade"] = df.apply(label_grade, axis=1)
 
@@ -187,7 +220,9 @@ print("\n[4] Training LightGBM...")
 FEATURES_GRADE = [
     "temperature", "humidity", "ammonia",
     "temp_avg_1h", "humid_avg_1h", "nh3_avg_1h",
-    "comfort_index", "is_daytime"
+    "comfort_index", "is_daytime",
+    # Optuna v2 features
+    "day_of_week", "temp_humid_interaction", "time_norm",
 ]
 
 X_grade = df[FEATURES_GRADE].copy()
@@ -202,6 +237,7 @@ np.random.seed(RANDOM_STATE)
 def make_sample(t, h, n, daytime=None):
     if daytime is None:
         daytime = np.random.choice([0, 1])
+    hour = np.random.randint(6, 18) if daytime else np.random.randint(0, 6)
     return {
         "temperature": round(t, 1),
         "humidity": round(h, 1),
@@ -211,6 +247,9 @@ def make_sample(t, h, n, daytime=None):
         "nh3_avg_1h": round(n + np.random.uniform(-2, 2), 1),
         "comfort_index": calculate_comfort_index(t, h, n),
         "is_daytime": daytime,
+        "day_of_week": np.random.randint(0, 7),
+        "temp_humid_interaction": round(t * h / 100.0, 2),
+        "time_norm": round(hour / 24.0, 3),
     }
 
 # --- BURUK: hanya kondisi yang JELAS buruk (sesuai rule label_grade) ---
@@ -349,15 +388,21 @@ test_samples = [
     {"temperature": 28.5, "humidity": 78.0, "ammonia": 5.0,
      "temp_avg_1h": 28.3, "humid_avg_1h": 77.5, "nh3_avg_1h": 5.2,
      "comfort_index": calculate_comfort_index(28.5, 78.0, 5.0),
-     "is_daytime": 1},
+     "is_daytime": 1, "day_of_week": 2,
+     "temp_humid_interaction": round(28.5 * 78.0 / 100.0, 2),
+     "time_norm": round(14 / 24.0, 3)},
     {"temperature": 33.0, "humidity": 60.0, "ammonia": 25.0,
      "temp_avg_1h": 32.5, "humid_avg_1h": 62.0, "nh3_avg_1h": 23.0,
      "comfort_index": calculate_comfort_index(33.0, 60.0, 25.0),
-     "is_daytime": 1},
+     "is_daytime": 1, "day_of_week": 2,
+     "temp_humid_interaction": round(33.0 * 60.0 / 100.0, 2),
+     "time_norm": round(14 / 24.0, 3)},
     {"temperature": 25.0, "humidity": 85.0, "ammonia": 12.0,
      "temp_avg_1h": 25.5, "humid_avg_1h": 84.0, "nh3_avg_1h": 11.5,
      "comfort_index": calculate_comfort_index(25.0, 85.0, 12.0),
-     "is_daytime": 0},
+     "is_daytime": 0, "day_of_week": 5,
+     "temp_humid_interaction": round(25.0 * 85.0 / 100.0, 2),
+     "time_norm": round(3 / 24.0, 3)},
 ]
 
 for i, sample in enumerate(test_samples, 1):

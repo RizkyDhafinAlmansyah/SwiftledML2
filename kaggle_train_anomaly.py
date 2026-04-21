@@ -31,13 +31,13 @@ import joblib
 # -----------------------------
 # 0. Path data & artefak
 # -----------------------------
-# Kaggle
-DATA_PATH = "/kaggle/input/sensor-syntesis/ml_training_dataset.csv"
+# Kaggle — dataset: real + external (GAMS indoor)
+DATA_PATH = "/kaggle/input/swiftledml-merged-external/ml_training_with_external.csv"
 MODELS_DIR = "/kaggle/working"
 
 # Lokal (uncomment jika di lokal)
-# DATA_PATH = "data/ml_training_dataset.csv"
-# MODELS_DIR = "models"
+# DATA_PATH = "data/ml_training_with_external.csv"
+# MODELS_DIR = "ai-engine"
 
 os.makedirs(MODELS_DIR, exist_ok=True)
 
@@ -55,7 +55,7 @@ HISTORY_WINDOW = 10
 MIN_DELTA_THRESHOLD = 0.5
 SPIKE_Z_THRESHOLD = 3.0
 SPIKE_PCT_THRESHOLD = 30.0
-CONTAMINATION = 0.15  # 15% data dianggap anomali
+CONTAMINATION = 0.02  # 2% — hanya sensor error / nilai impossible
 
 # ============================================================
 # 1. LOAD & PRE-CLEAN DATA
