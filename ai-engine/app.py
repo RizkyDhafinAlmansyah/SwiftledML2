@@ -562,7 +562,7 @@ def _detect_anomaly(values: Dict[str, Optional[float]]):
     try:
         base_feat = build_base_features(t, r, n)
         X_anom = pd.DataFrame([[base_feat[f] for f in FEATURES_ANOMALY]], columns=FEATURES_ANOMALY)
-        X_scaled = anomaly_scaler_v2.transform(X_anom)
+        X_scaled = anomaly_scaler_v2.transform(X_anom.values)
 
         iso_pred = int(anomaly_model_v2.predict(X_scaled)[0])  # 1 normal, -1 anomaly
         iso_score = float(anomaly_model_v2.decision_function(X_scaled)[0])
