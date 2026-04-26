@@ -412,6 +412,22 @@ def predict_pump_ml(
             "duration_seconds": 25.0,
             "engine": "safety",
         }
+    if t >= 32.0 and h <= 70.0:
+        return {
+            "action": "turn_on",
+            "reason": f"TEMP_HIGH ({t:.1f}°C) + RH_LOW ({h:.1f}%) - safety override",
+            "confidence": 0.95,
+            "duration_seconds": 20.0,
+            "engine": "safety",
+        }
+    if h <= 60.0:
+        return {
+            "action": "turn_on",
+            "reason": f"RH_CRITICAL ({h:.1f}% <=60%) - safety override",
+            "confidence": 0.99,
+            "duration_seconds": 20.0,
+            "engine": "safety",
+        }
 
     # ---------- 2. ML prediction ----------
     if pump_state_model_v2 is not None:
